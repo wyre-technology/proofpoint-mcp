@@ -1,5 +1,5 @@
 {
-  "name": "@wyre-technology/mcp-server-proofpoint",
+  "name": "@wyre-technology/proofpoint-mcp",
   "version": "1.0.0",
   "description": "MCP server for Proofpoint Email Protection - email security, threat intelligence, TAP (Targeted Attack Protection), and email filtering API integration",
   "type": "module",
