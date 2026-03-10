@@ -47,6 +47,14 @@ import { isDomainName, type DomainName } from "./utils/types.js";
 import { getCredentials } from "./utils/client.js";
 import { logger } from "./utils/logger.js";
 import { setServerRef } from "./utils/server-ref.js";
+import {
+  TOOL_CATEGORIES,
+  buildToolToCategoryMap,
+  routeIntent,
+} from "./utils/categories.js";
+
+// Lazy-loading mode flag
+const LAZY_LOADING = process.env.LAZY_LOADING === "true";
 
 // Server navigation state
 let currentDomain: DomainName | null = null;
@@ -112,6 +120,84 @@ const statusTool: Tool = {
   },
 };
 
+// ──────────────────────────────────────────────────────────
+// Lazy-loading meta-tools (active when LAZY_LOADING=true)
+// ──────────────────────────────────────────────────────────
+
+const toolToCategoryMap = buildToolToCategoryMap();
+
+const metaToolListCategories: Tool = {
+  name: "proofpoint_list_categories",
+  description:
+    "List all Proofpoint tool categories with descriptions and tool counts. Use this to discover what capabilities are available.",
+  inputSchema: {
+    type: "object",
+    properties: {},
+  },
+};
+
+const metaToolListCategoryTools: Tool = {
+  name: "proofpoint_list_category_tools",
+  description:
+    "List the full tool schemas for a specific category. Call this to see detailed input schemas before executing a tool.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      category: {
+        type: "string",
+        enum: Object.keys(TOOL_CATEGORIES),
+        description: "The category to list tools for",
+      },
+    },
+    required: ["category"],
+  },
+};
+
+const metaToolExecute: Tool = {
+  name: "proofpoint_execute_tool",
+  description:
+    "Execute any Proofpoint tool by name. Use proofpoint_list_category_tools first to discover available tools and their schemas.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      toolName: {
+        type: "string",
+        description: "The full tool name to execute (e.g. proofpoint_tap_get_all_threats)",
+      },
+      arguments: {
+        type: "object",
+        description: "The arguments to pass to the tool",
+        additionalProperties: true,
+      },
+    },
+    required: ["toolName"],
+  },
+};
+
+const metaToolRouter: Tool = {
+  name: "proofpoint_router",
+  description:
+    "Describe what you want to do in plain English and get suggestions for which category and tools to use.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      intent: {
+        type: "string",
+        description:
+          "A natural language description of what you want to accomplish (e.g. 'find phishing threats from last 24 hours')",
+      },
+    },
+    required: ["intent"],
+  },
+};
+
+const metaTools: Tool[] = [
+  metaToolListCategories,
+  metaToolListCategoryTools,
+  metaToolExecute,
+  metaToolRouter,
+];
+
 /**
  * Get tools based on current navigation state
  */
@@ -132,6 +218,9 @@ async function getToolsForState(): Promise<Tool[]> {
 
 // Handle ListTools requests
 server.setRequestHandler(ListToolsRequestSchema, async () => {
+  if (LAZY_LOADING) {
+    return { tools: metaTools };
+  }
   const tools = await getToolsForState();
   return { tools };
 });
@@ -222,7 +311,119 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
-    // Domain-specific tool calls
+    // ── Lazy-loading meta-tool handlers ──
+
+    if (name === "proofpoint_list_categories") {
+      const categories = Object.entries(TOOL_CATEGORIES).map(
+        ([catName, cat]) => ({
+          name: catName,
+          description: cat.description,
+          toolCount: cat.tools.length,
+        })
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ categories }, null, 2),
+          },
+        ],
+      };
+    }
+
+    if (name === "proofpoint_list_category_tools") {
+      const { category } = args as { category: string };
+      const cat = TOOL_CATEGORIES[category];
+      if (!cat) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Unknown category: '${category}'. Available: ${Object.keys(TOOL_CATEGORIES).join(", ")}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      const handler = await getDomainHandler(cat.domain);
+      const domainTools = handler.getTools();
+      // Only return tools that belong to this category
+      const filtered = domainTools.filter((t) => cat.tools.includes(t.name));
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ category, tools: filtered }, null, 2),
+          },
+        ],
+      };
+    }
+
+    if (name === "proofpoint_execute_tool") {
+      const { toolName, arguments: toolArgs } = args as {
+        toolName: string;
+        arguments?: Record<string, unknown>;
+      };
+      const categoryName = toolToCategoryMap.get(toolName);
+      if (!categoryName) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Unknown tool: '${toolName}'. Use proofpoint_list_categories and proofpoint_list_category_tools to discover available tools.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      const cat = TOOL_CATEGORIES[categoryName];
+      const handler = await getDomainHandler(cat.domain);
+      return handler.handleCall(toolName, toolArgs ?? {});
+    }
+
+    if (name === "proofpoint_router") {
+      const { intent } = args as { intent: string };
+      const matchedCategories = routeIntent(intent);
+
+      if (matchedCategories.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No matching categories found for: "${intent}". Use proofpoint_list_categories to see all available categories.`,
+            },
+          ],
+        };
+      }
+
+      const suggestions = matchedCategories.slice(0, 3).map((catName) => {
+        const cat = TOOL_CATEGORIES[catName];
+        return {
+          category: catName,
+          description: cat.description,
+          tools: cat.tools,
+        };
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                intent,
+                suggestions,
+                hint: "Use proofpoint_list_category_tools to see full schemas, then proofpoint_execute_tool to run a tool.",
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+
+    // Domain-specific tool calls (decision-tree mode)
     if (currentDomain !== null) {
       const handler = await getDomainHandler(currentDomain);
       const domainTools = handler.getTools();
@@ -267,7 +468,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function startStdioTransport(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  logger.info("Proofpoint MCP server running on stdio (decision tree mode)");
+  logger.info(`Proofpoint MCP server running on stdio (${LAZY_LOADING ? "lazy-loading" : "decision-tree"} mode)`);
 }
 
 /**
@@ -379,6 +580,7 @@ async function main() {
   const transportType = process.env.MCP_TRANSPORT || "stdio";
   logger.info("Starting Proofpoint MCP server", {
     transport: transportType,
+    toolMode: LAZY_LOADING ? "lazy-loading" : "decision-tree",
     logLevel: process.env.LOG_LEVEL || "info",
     nodeVersion: process.version,
   });

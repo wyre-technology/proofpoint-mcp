@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Lazy-loading meta-tools mode (`LAZY_LOADING=true` env var) as alternative to decision-tree navigation
+- `proofpoint_list_categories` meta-tool to discover all 11 domain categories
+- `proofpoint_list_category_tools` meta-tool to lazy-load full tool schemas per category
+- `proofpoint_execute_tool` meta-tool to execute any domain tool by name
+- `proofpoint_router` meta-tool for intent-based tool discovery via keyword matching
+- `src/utils/categories.ts` with tool category definitions and intent routing
+
 ## [1.0.0] - 2026-03-10
 
 ### Added
