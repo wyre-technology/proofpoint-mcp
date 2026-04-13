@@ -3,13 +3,14 @@
  *
  * Proofpoint APIs use HTTP Basic Auth with a service principal + secret.
  *
- * In gateway mode (AUTH_MODE=gateway), credentials are injected
- * into process.env by the HTTP transport layer from request headers.
+ * In gateway mode (AUTH_MODE=gateway), credentials are passed per-request
+ * via AsyncLocalStorage to avoid cross-tenant leakage under concurrent load.
  *
  * In env mode (AUTH_MODE=env or unset), credentials come from
  * PROOFPOINT_SERVICE_PRINCIPAL and PROOFPOINT_SERVICE_SECRET environment variables.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { logger } from "./logger.js";
 import type { ProofpointCredentials } from "./types.js";
 
@@ -20,9 +21,30 @@ import type { ProofpointCredentials } from "./types.js";
 const DEFAULT_BASE_URL = "https://tap-api-v2.proofpoint.com";
 
 /**
- * Get credentials from environment variables
+ * Per-request credential store for gateway mode.
+ * Ensures concurrent requests cannot leak credentials across tenants.
+ */
+const credentialStore = new AsyncLocalStorage<ProofpointCredentials>();
+
+/**
+ * Run a callback with per-request credential overrides.
+ * Used by the HTTP transport in gateway mode.
+ */
+export function runWithCredentials<T>(creds: ProofpointCredentials, fn: () => T): T {
+  return credentialStore.run(creds, fn);
+}
+
+/**
+ * Get credentials — checks per-request store first, then falls back to env vars.
  */
 export function getCredentials(): ProofpointCredentials | null {
+  // Per-request override (gateway mode)
+  const override = credentialStore.getStore();
+  if (override) {
+    return override;
+  }
+
+  // Fallback to environment variables (stdio / env mode)
   const servicePrincipal = process.env.PROOFPOINT_SERVICE_PRINCIPAL;
   const serviceSecret = process.env.PROOFPOINT_SERVICE_SECRET;
 
