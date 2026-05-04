@@ -95,7 +95,16 @@ function getTools(): Tool[] {
     {
       name: "proofpoint_quarantine_release",
       description:
-        "Release a quarantined message, delivering it to the intended recipient.",
+        "⚠ HIGH-IMPACT. Release a quarantined message, delivering it to the intended recipient. " +
+        "Irreversible delivery but message itself is preserved. Can deliver malicious mail to user. " +
+        "Confirm with the user before invoking.",
+      annotations: {
+        title: "Release quarantined message (reversible)",
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -110,7 +119,16 @@ function getTools(): Tool[] {
     {
       name: "proofpoint_quarantine_delete",
       description:
-        "Permanently delete a quarantined message. This action cannot be undone.",
+        "⚠ DESTRUCTIVE — IRREVERSIBLE. Permanently delete a quarantined message. " +
+        "This action cannot be undone and will remove the message from quarantine storage. " +
+        "Confirm with the user before invoking.",
+      annotations: {
+        title: "Delete quarantined message (irreversible)",
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
       inputSchema: {
         type: "object" as const,
         properties: {
