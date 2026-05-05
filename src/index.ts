@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 /**
- * Proofpoint MCP Server with Decision Tree Architecture
+ * Proofpoint MCP Server
  *
- * This MCP server uses a hierarchical tool loading approach:
- * 1. Initially exposes only a navigation tool
- * 2. After user selects a domain, exposes domain-specific tools
- * 3. Lazy-loads domain handlers on first access
+ * This MCP server provides tools for interacting with the Proofpoint Email Protection API.
+ * All tools are listed upfront so they work with every MCP client, including
+ * remote connectors (claude.ai, mcp-remote) that do not support dynamic
+ * tool-list changes. A helper `proofpoint_navigate` tool provides domain
+ * discovery and guidance.
  *
  * Supports both stdio and HTTP transports:
  * - stdio (default): For local Claude Desktop / CLI usage
@@ -56,9 +57,6 @@ import {
 // Lazy-loading mode flag
 const LAZY_LOADING = process.env.LAZY_LOADING === "true";
 
-// Server navigation state
-let currentDomain: DomainName | null = null;
-
 // Create the MCP server
 const server = new Server(
   {
@@ -75,20 +73,57 @@ const server = new Server(
 setServerRef(server);
 
 /**
- * Navigation tool - shown when at root (no domain selected)
+ * Available domains for navigation
+ */
+type Domain = DomainName;
+
+/**
+ * Domain metadata for navigation
+ */
+const domainDescriptions: Record<Domain, string> = {
+  tap: "Targeted Attack Protection (TAP) - SIEM API for threats, clicks, messages, and attack intelligence",
+  quarantine: "Quarantine management - list, release, delete, and search quarantined email messages",
+  threat_intel: "Threat intelligence - IOCs, threat families, campaigns, and security indicators",
+  dlp: "Data Loss Prevention & email encryption - manage sensitive data protection policies",
+  people: "User risk scoring and Very Attacked People (VAP) reports - identify high-risk users",
+  forensics: "Forensics and threat response - auto-pull, search & destroy malicious content",
+  smart_search: "Message tracing / Smart Search - track email delivery and routing",
+  policy: "Policy management - configure email security rules and enforcement",
+  url_defense: "URL Defense - URL decoding, analysis, and malicious link protection",
+  events: "Security events - spam, phishing, and malware detection alerts",
+  reports: "Organization-level security reports - threat summaries and analytics",
+};
+
+/**
+ * Navigation / discovery tool - helps the LLM find the right tools
+ *
+ * This is a stateless helper that describes available tools for a domain.
+ * All domain tools are always listed in tools/list regardless of navigation
+ * state, because many MCP clients (claude.ai connectors, mcp-remote) only
+ * fetch the tool list once and do not support notifications/tools/list_changed.
  */
 const navigateTool: Tool = {
   name: "proofpoint_navigate",
   description:
-    "Navigate to a Proofpoint domain to access its tools. Available domains: tap (Targeted Attack Protection - SIEM threats/clicks/messages), quarantine (manage email quarantine), threat_intel (IOCs, campaigns, threat families), dlp (data loss prevention & encryption), people (user risk scores & VAP reports), forensics (threat response & search-and-destroy), smart_search (message tracing), policy (email security policies), url_defense (URL decoding & analysis), events (spam/phish/malware detections), reports (org-level security reports).",
+    "Discover available Proofpoint tools by domain. Returns tool names and descriptions for the selected domain. All tools are callable at any time — this is a help/discovery aid, not a prerequisite.",
   inputSchema: {
     type: "object",
     properties: {
       domain: {
         type: "string",
         enum: getAvailableDomains(),
-        description:
-          "The domain to navigate to",
+        description: `The domain to explore:
+- tap: ${domainDescriptions.tap}
+- quarantine: ${domainDescriptions.quarantine}
+- threat_intel: ${domainDescriptions.threat_intel}
+- dlp: ${domainDescriptions.dlp}
+- people: ${domainDescriptions.people}
+- forensics: ${domainDescriptions.forensics}
+- smart_search: ${domainDescriptions.smart_search}
+- policy: ${domainDescriptions.policy}
+- url_defense: ${domainDescriptions.url_defense}
+- events: ${domainDescriptions.events}
+- reports: ${domainDescriptions.reports}`,
       },
     },
     required: ["domain"],
@@ -96,11 +131,11 @@ const navigateTool: Tool = {
 };
 
 /**
- * Back navigation tool - shown when inside a domain
+ * Status tool - shows credentials status and available domains
  */
-const backTool: Tool = {
-  name: "proofpoint_back",
-  description: "Navigate back to the main menu to select a different domain",
+const statusTool: Tool = {
+  name: "proofpoint_status",
+  description: "Show credentials status and available domains",
   inputSchema: {
     type: "object",
     properties: {},
@@ -108,17 +143,38 @@ const backTool: Tool = {
 };
 
 /**
- * Status tool - always available
+ * Map from domain name to its tool definitions (loaded lazily)
  */
-const statusTool: Tool = {
-  name: "proofpoint_status",
-  description:
-    "Show current navigation state and available domains. Also verifies API credentials are configured.",
-  inputSchema: {
-    type: "object",
-    properties: {},
-  },
-};
+const domainToolMap = new Map<DomainName, Tool[]>();
+
+/**
+ * All domain tools, collected once at startup
+ */
+let allDomainTools: Tool[] | null = null;
+
+/**
+ * Load all domain tools (lazy-loaded on first access)
+ */
+async function getAllDomainTools(): Promise<Tool[]> {
+  if (allDomainTools !== null) {
+    return allDomainTools;
+  }
+
+  const domains = getAvailableDomains();
+  const tools: Tool[] = [];
+
+  for (const domain of domains) {
+    if (!domainToolMap.has(domain)) {
+      const handler = await getDomainHandler(domain);
+      const domainTools = handler.getTools();
+      domainToolMap.set(domain, domainTools);
+    }
+    tools.push(...domainToolMap.get(domain)!);
+  }
+
+  allDomainTools = tools;
+  return tools;
+}
 
 // ──────────────────────────────────────────────────────────
 // Lazy-loading meta-tools (active when LAZY_LOADING=true)
@@ -198,31 +254,13 @@ const metaTools: Tool[] = [
   metaToolRouter,
 ];
 
-/**
- * Get tools based on current navigation state
- */
-async function getToolsForState(): Promise<Tool[]> {
-  const tools: Tool[] = [statusTool];
-
-  if (currentDomain === null) {
-    tools.unshift(navigateTool);
-  } else {
-    tools.unshift(backTool);
-    const handler = await getDomainHandler(currentDomain);
-    const domainTools = handler.getTools();
-    tools.push(...domainTools);
-  }
-
-  return tools;
-}
-
-// Handle ListTools requests
+// Handle ListTools requests - always returns ALL tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   if (LAZY_LOADING) {
     return { tools: metaTools };
   }
-  const tools = await getToolsForState();
-  return { tools };
+  const domainTools = await getAllDomainTools();
+  return { tools: [navigateTool, statusTool, ...domainTools] };
 });
 
 // Handle CallTool requests
@@ -231,70 +269,39 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   logger.info("Tool call received", { tool: name, arguments: args });
 
   try {
-    // Navigate to a domain
+    // Handle navigation / discovery helper
     if (name === "proofpoint_navigate") {
-      const domain = (args as { domain: string }).domain;
+      const { domain } = args as { domain: Domain };
 
       if (!isDomainName(domain)) {
         return {
           content: [
             {
               type: "text",
-              text: `Invalid domain: '${domain}'. Available domains: ${getAvailableDomains().join(", ")}`,
+              text: `Invalid domain: ${domain}. Available domains: ${getAvailableDomains().join(", ")}`,
             },
           ],
           isError: true,
         };
       }
 
-      // Validate credentials before allowing navigation
-      const creds = getCredentials();
-      if (!creds) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Error: No API credentials configured. Please set the PROOFPOINT_SERVICE_PRINCIPAL and PROOFPOINT_SERVICE_SECRET environment variables.",
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      currentDomain = domain;
       const handler = await getDomainHandler(domain);
-      const domainTools = handler.getTools();
+      const tools = handler.getTools();
 
-      logger.info("Navigated to domain", { domain, toolCount: domainTools.length });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Navigated to ${domain} domain.\n\nAvailable tools:\n${domainTools
-              .map((t) => `- ${t.name}: ${t.description}`)
-              .join("\n")}\n\nUse proofpoint_back to return to the main menu.`,
-          },
-        ],
-      };
-    }
-
-    // Navigate back to root
-    if (name === "proofpoint_back") {
-      const previousDomain = currentDomain;
-      currentDomain = null;
+      const toolSummary = tools
+        .map((t) => `- ${t.name}: ${t.description}`)
+        .join("\n");
 
       return {
         content: [
           {
             type: "text",
-            text: `Navigated back from ${previousDomain || "root"} to the main menu.\n\nAvailable domains: ${getAvailableDomains().join(", ")}\n\nUse proofpoint_navigate to select a domain.`,
+            text: `${domainDescriptions[domain]}\n\nAvailable tools:\n${toolSummary}\n\nYou can call any of these tools directly.`,
           },
         ],
       };
     }
 
-    // Status check
     if (name === "proofpoint_status") {
       const creds = getCredentials();
       const credStatus = creds
@@ -305,7 +312,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: `Proofpoint MCP Server Status\n\nCurrent domain: ${currentDomain || "(none - at main menu)"}\nCredentials: ${credStatus}\nAvailable domains: ${getAvailableDomains().join(", ")}`,
+            text: `Proofpoint MCP Server Status\n\nCredentials: ${credStatus}\nAvailable domains: ${getAvailableDomains().join(", ")}\n\nAll tools are available at all times. Use proofpoint_navigate to discover tools by domain.`,
           },
         ],
       };
@@ -423,30 +430,60 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
-    // Domain-specific tool calls (decision-tree mode)
-    if (currentDomain !== null) {
-      const handler = await getDomainHandler(currentDomain);
-      const domainTools = handler.getTools();
-      const toolExists = domainTools.some((t) => t.name === name);
+    // Route to appropriate domain handler based on tool prefix
+    const toolArgs = (args ?? {}) as Record<string, unknown>;
 
-      if (toolExists) {
-        const result = await handler.handleCall(name, args as Record<string, unknown>);
-        logger.debug("Tool call completed", {
-          tool: name,
-          responseSize: JSON.stringify(result).length,
-        });
-        return result;
-      }
+    if (name.startsWith("proofpoint_tap_")) {
+      const handler = await getDomainHandler("tap");
+      return await handler.handleCall(name, toolArgs);
+    }
+    if (name.startsWith("proofpoint_quarantine_")) {
+      const handler = await getDomainHandler("quarantine");
+      return await handler.handleCall(name, toolArgs);
+    }
+    if (name.startsWith("proofpoint_threat_intel_")) {
+      const handler = await getDomainHandler("threat_intel");
+      return await handler.handleCall(name, toolArgs);
+    }
+    if (name.startsWith("proofpoint_dlp_")) {
+      const handler = await getDomainHandler("dlp");
+      return await handler.handleCall(name, toolArgs);
+    }
+    if (name.startsWith("proofpoint_people_")) {
+      const handler = await getDomainHandler("people");
+      return await handler.handleCall(name, toolArgs);
+    }
+    if (name.startsWith("proofpoint_forensics_")) {
+      const handler = await getDomainHandler("forensics");
+      return await handler.handleCall(name, toolArgs);
+    }
+    if (name.startsWith("proofpoint_smart_search_")) {
+      const handler = await getDomainHandler("smart_search");
+      return await handler.handleCall(name, toolArgs);
+    }
+    if (name.startsWith("proofpoint_policy_")) {
+      const handler = await getDomainHandler("policy");
+      return await handler.handleCall(name, toolArgs);
+    }
+    if (name.startsWith("proofpoint_url_defense_")) {
+      const handler = await getDomainHandler("url_defense");
+      return await handler.handleCall(name, toolArgs);
+    }
+    if (name.startsWith("proofpoint_events_")) {
+      const handler = await getDomainHandler("events");
+      return await handler.handleCall(name, toolArgs);
+    }
+    if (name.startsWith("proofpoint_reports_")) {
+      const handler = await getDomainHandler("reports");
+      return await handler.handleCall(name, toolArgs);
     }
 
-    // Tool not found
+    // Unknown tool
     return {
       content: [
         {
           type: "text",
-          text: currentDomain
-            ? `Unknown tool: '${name}'. You are in the '${currentDomain}' domain. Use proofpoint_back to return to the main menu.`
-            : `Unknown tool: '${name}'. Use proofpoint_navigate to select a domain first.`,
+          text: `Unknown tool: ${name}. Use proofpoint_navigate to discover available tools by domain.`,
         },
       ],
       isError: true,
@@ -468,7 +505,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function startStdioTransport(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  logger.info(`Proofpoint MCP server running on stdio (${LAZY_LOADING ? "lazy-loading" : "decision-tree"} mode)`);
+  logger.info(`Proofpoint MCP server running on stdio (${LAZY_LOADING ? "lazy-loading" : "flattened"} mode)`);
 }
 
 /**
@@ -588,7 +625,7 @@ async function main() {
   const transportType = process.env.MCP_TRANSPORT || "stdio";
   logger.info("Starting Proofpoint MCP server", {
     transport: transportType,
-    toolMode: LAZY_LOADING ? "lazy-loading" : "decision-tree",
+    toolMode: LAZY_LOADING ? "lazy-loading" : "flattened",
     logLevel: process.env.LOG_LEVEL || "info",
     nodeVersion: process.version,
   });
