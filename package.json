@@ -22,7 +22,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wyre-technology/mcp-server-proofpoint.git"
+    "url": "git+https://github.com/wyre-technology/proofpoint-mcp.git"
   },
   "keywords": [
     "mcp",
@@ -39,9 +39,9 @@
   "author": "Wyre Technology",
   "license": "Apache-2.0",
   "bugs": {
-    "url": "https://github.com/wyre-technology/mcp-server-proofpoint/issues"
+    "url": "https://github.com/wyre-technology/proofpoint-mcp/issues"
   },
-  "homepage": "https://github.com/wyre-technology/mcp-server-proofpoint#readme",
+  "homepage": "https://github.com/wyre-technology/proofpoint-mcp#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.3"
   },
