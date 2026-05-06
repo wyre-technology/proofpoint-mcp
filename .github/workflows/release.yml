@@ -55,6 +55,7 @@ jobs:
     permissions:
       contents: write
       issues: write
+      packages: write
     outputs:
       version: ${{ steps.release-version.outputs.version }}
       released: ${{ steps.release-version.outputs.released }}
