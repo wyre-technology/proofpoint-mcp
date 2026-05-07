@@ -138,7 +138,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5.10.0
         with:
-          images: ghcr.io/wyre-technology/proofpoint-mcp
+          images: ghcr.io/${{ github.repository }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -154,13 +154,13 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/wyre-technology/proofpoint-mcp:latest
-            ghcr.io/wyre-technology/proofpoint-mcp:v${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:v${{ needs.release.outputs.version }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
-            VERSION=${{ steps.version.outputs.version }}
+            VERSION=${{ needs.release.outputs.version }}
             COMMIT_SHA=${{ github.sha }}
             BUILD_DATE=${{ github.event.head_commit.timestamp }}
 
@@ -189,7 +189,7 @@ jobs:
         run: |
           jq --arg v "$VERSION" \
             '.version = $v
-             | .packages[0].identifier = "ghcr.io/wyre-technology/proofpoint-mcp:v" + $v' \
+             | .packages[0].identifier = "ghcr.io/${{ github.repository }}:v" + $v' \
             server.json > server.json.tmp
           mv server.json.tmp server.json
           cat server.json
@@ -206,5 +206,5 @@ jobs:
       - name: Verify registry listing
         run: |
           sleep 5
-          curl -sf "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.wyre-technology/proofpoint-mcp" \
+          curl -sf "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.wyre-technology/datto-rmm-mcp" \
             | jq '.servers[] | {name, version}'
