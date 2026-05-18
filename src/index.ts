@@ -527,25 +527,14 @@ async function startHttpTransport(): Promise<void> {
   const httpServer = createHttpServer((req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
-    // Health check - no auth required
-    if (url.pathname === "/health") {
-      const creds = getCredentials();
-      const statusCode = creds ? 200 : 503;
-
-      res.writeHead(statusCode, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          status: creds ? "ok" : "degraded",
-          transport: "http",
-          authMode: isGatewayMode ? "gateway" : "env",
-          timestamp: new Date().toISOString(),
-          credentials: {
-            configured: !!creds,
-          },
-          logLevel: process.env.LOG_LEVEL || "info",
-          version: "1.0.0",
-        })
-      );
+    // Health check - shallow, unauthenticated liveness probe.
+    // Must NOT call getCredentials() or any upstream: in gateway mode
+    // credentials only arrive per-request via headers, so a credential
+    // check here would always fail the Azure liveness probe and the
+    // container would be SIGTERM-killed in a crash loop.
+    if (url.pathname === "/health" || url.pathname === "/healthz") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok" }));
       return;
     }
 

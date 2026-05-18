@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `/health` no longer calls `getCredentials()` — it is now a shallow, unauthenticated liveness probe returning `200 {"status":"ok"}`. In gateway mode credentials only arrive per-request via headers, so the previous credential check always returned `503`, failing the Azure liveness probe and crash-looping the container. Also added `/healthz` as an alias.
+
 ### Added
 
 - Lazy-loading meta-tools mode (`LAZY_LOADING=true` env var) as alternative to decision-tree navigation
