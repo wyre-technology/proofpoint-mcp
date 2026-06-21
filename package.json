@@ -18,7 +18,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
     "test:watch": "vitest",
-    "lint": "eslint src --ext .ts"
+    "lint": "eslint src"
   },
   "repository": {
     "type": "git",
@@ -46,15 +46,16 @@
     "@modelcontextprotocol/sdk": "^1.29.0"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.4",
     "@semantic-release/changelog": "^6.0.3",
     "@semantic-release/git": "^10.0.1",
     "@semantic-release/github": "^11.0.0",
     "@types/node": "^25.9.2",
-    "@typescript-eslint/eslint-plugin": "^6.19.0",
-    "@typescript-eslint/parser": "^6.19.0",
-    "eslint": "^8.56.0",
+    "eslint": "^9.39.4",
+    "globals": "^17.6.0",
     "semantic-release": "^25.0.0",
     "typescript": "^5.3.3",
+    "typescript-eslint": "^8.61.1",
     "vitest": "^1.2.0"
   },
   "engines": {
