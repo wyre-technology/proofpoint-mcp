@@ -12,6 +12,13 @@
  * - stdio (default): For local Claude Desktop / CLI usage
  * - http: For hosted deployment with optional gateway auth
  *
+ * The HTTP transport is STATELESS: each POST to /mcp gets a fresh Server +
+ * StreamableHTTPServerTransport (created with no sessionIdGenerator). This lets
+ * multiple clients initialize independently. A single shared stateful transport
+ * would reject every client after the first with
+ * "-32600 Server already initialized", so behind the multi-user gateway only the
+ * first user since container start would receive any tools.
+ *
  * Auth modes:
  * - env (default): Credentials from PROOFPOINT_SERVICE_PRINCIPAL and
  *   PROOFPOINT_SERVICE_SECRET environment variables
@@ -34,7 +41,6 @@
  */
 
 import { createServer as createHttpServer, IncomingMessage, ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -44,7 +50,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { getDomainHandler, getAvailableDomains } from "./domains/index.js";
-import { isDomainName, type DomainName } from "./utils/types.js";
+import { isDomainName, type DomainName, type ProofpointCredentials } from "./utils/types.js";
 import { getCredentials, runWithCredentials } from "./utils/client.js";
 import { logger } from "./utils/logger.js";
 import { setServerRef } from "./utils/server-ref.js";
@@ -56,21 +62,6 @@ import {
 
 // Lazy-loading mode flag
 const LAZY_LOADING = process.env.LAZY_LOADING === "true";
-
-// Create the MCP server
-const server = new Server(
-  {
-    name: "mcp-server-proofpoint",
-    version: "1.0.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
-
-setServerRef(server);
 
 /**
  * Available domains for navigation
@@ -254,255 +245,344 @@ const metaTools: Tool[] = [
   metaToolRouter,
 ];
 
-// Handle ListTools requests - always returns ALL tools
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  if (LAZY_LOADING) {
-    return { tools: metaTools };
-  }
-  const domainTools = await getAllDomainTools();
-  return { tools: [navigateTool, statusTool, ...domainTools] };
-});
-
-// Handle CallTool requests
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-  logger.info("Tool call received", { tool: name, arguments: args });
-
-  try {
-    // Handle navigation / discovery helper
-    if (name === "proofpoint_navigate") {
-      const { domain } = args as { domain: Domain };
-
-      if (!isDomainName(domain)) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Invalid domain: ${domain}. Available domains: ${getAvailableDomains().join(", ")}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      const handler = await getDomainHandler(domain);
-      const tools = handler.getTools();
-
-      const toolSummary = tools
-        .map((t) => `- ${t.name}: ${t.description}`)
-        .join("\n");
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `${domainDescriptions[domain]}\n\nAvailable tools:\n${toolSummary}\n\nYou can call any of these tools directly.`,
-          },
-        ],
-      };
+/**
+ * Create a fresh MCP Server instance with all request handlers registered.
+ *
+ * Called ONCE for stdio mode, and ONCE PER HTTP REQUEST for the Streamable
+ * HTTP transport. A fresh Server (and Transport) per request is what keeps the
+ * HTTP transport stateless so every client can initialize independently — see
+ * the module header for why a shared stateful transport breaks multi-client use.
+ */
+function createFreshServer(): Server {
+  const server = new Server(
+    {
+      name: "mcp-server-proofpoint",
+      version: "1.0.0",
+    },
+    {
+      capabilities: {
+        tools: {},
+      },
     }
+  );
 
-    if (name === "proofpoint_status") {
-      const creds = getCredentials();
-      const credStatus = creds
-        ? "Configured"
-        : "NOT CONFIGURED - Please set PROOFPOINT_SERVICE_PRINCIPAL and PROOFPOINT_SERVICE_SECRET environment variables";
+  server.onerror = (error) => {
+    logger.error("MCP server error", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  };
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Proofpoint MCP Server Status\n\nCredentials: ${credStatus}\nAvailable domains: ${getAvailableDomains().join(", ")}\n\nAll tools are available at all times. Use proofpoint_navigate to discover tools by domain.`,
-          },
-        ],
-      };
+  // Elicitation helpers reach the active server through this shared ref.
+  setServerRef(server);
+
+  // Handle ListTools requests - always returns ALL tools
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    if (LAZY_LOADING) {
+      return { tools: metaTools };
     }
+    const domainTools = await getAllDomainTools();
+    return { tools: [navigateTool, statusTool, ...domainTools] };
+  });
 
-    // ── Lazy-loading meta-tool handlers ──
+  // Handle CallTool requests
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    logger.info("Tool call received", { tool: name, arguments: args });
 
-    if (name === "proofpoint_list_categories") {
-      const categories = Object.entries(TOOL_CATEGORIES).map(
-        ([catName, cat]) => ({
-          name: catName,
-          description: cat.description,
-          toolCount: cat.tools.length,
-        })
-      );
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ categories }, null, 2),
-          },
-        ],
-      };
-    }
+    try {
+      // Handle navigation / discovery helper
+      if (name === "proofpoint_navigate") {
+        const { domain } = args as { domain: Domain };
 
-    if (name === "proofpoint_list_category_tools") {
-      const { category } = args as { category: string };
-      const cat = TOOL_CATEGORIES[category];
-      if (!cat) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Unknown category: '${category}'. Available: ${Object.keys(TOOL_CATEGORIES).join(", ")}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-      const handler = await getDomainHandler(cat.domain);
-      const domainTools = handler.getTools();
-      // Only return tools that belong to this category
-      const filtered = domainTools.filter((t) => cat.tools.includes(t.name));
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ category, tools: filtered }, null, 2),
-          },
-        ],
-      };
-    }
-
-    if (name === "proofpoint_execute_tool") {
-      const { toolName, arguments: toolArgs } = args as {
-        toolName: string;
-        arguments?: Record<string, unknown>;
-      };
-      const categoryName = toolToCategoryMap.get(toolName);
-      if (!categoryName) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Unknown tool: '${toolName}'. Use proofpoint_list_categories and proofpoint_list_category_tools to discover available tools.`,
-            },
-          ],
-          isError: true,
-        };
-      }
-      const cat = TOOL_CATEGORIES[categoryName];
-      const handler = await getDomainHandler(cat.domain);
-      return handler.handleCall(toolName, toolArgs ?? {});
-    }
-
-    if (name === "proofpoint_router") {
-      const { intent } = args as { intent: string };
-      const matchedCategories = routeIntent(intent);
-
-      if (matchedCategories.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `No matching categories found for: "${intent}". Use proofpoint_list_categories to see all available categories.`,
-            },
-          ],
-        };
-      }
-
-      const suggestions = matchedCategories.slice(0, 3).map((catName) => {
-        const cat = TOOL_CATEGORIES[catName];
-        return {
-          category: catName,
-          description: cat.description,
-          tools: cat.tools,
-        };
-      });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
+        if (!isDomainName(domain)) {
+          return {
+            content: [
               {
-                intent,
-                suggestions,
-                hint: "Use proofpoint_list_category_tools to see full schemas, then proofpoint_execute_tool to run a tool.",
+                type: "text",
+                text: `Invalid domain: ${domain}. Available domains: ${getAvailableDomains().join(", ")}`,
               },
-              null,
-              2
-            ),
+            ],
+            isError: true,
+          };
+        }
+
+        const handler = await getDomainHandler(domain);
+        const tools = handler.getTools();
+
+        const toolSummary = tools
+          .map((t) => `- ${t.name}: ${t.description}`)
+          .join("\n");
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${domainDescriptions[domain]}\n\nAvailable tools:\n${toolSummary}\n\nYou can call any of these tools directly.`,
+            },
+          ],
+        };
+      }
+
+      if (name === "proofpoint_status") {
+        const creds = getCredentials();
+        const credStatus = creds
+          ? "Configured"
+          : "NOT CONFIGURED - Please set PROOFPOINT_SERVICE_PRINCIPAL and PROOFPOINT_SERVICE_SECRET environment variables";
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Proofpoint MCP Server Status\n\nCredentials: ${credStatus}\nAvailable domains: ${getAvailableDomains().join(", ")}\n\nAll tools are available at all times. Use proofpoint_navigate to discover tools by domain.`,
+            },
+          ],
+        };
+      }
+
+      // ── Lazy-loading meta-tool handlers ──
+
+      if (name === "proofpoint_list_categories") {
+        const categories = Object.entries(TOOL_CATEGORIES).map(
+          ([catName, cat]) => ({
+            name: catName,
+            description: cat.description,
+            toolCount: cat.tools.length,
+          })
+        );
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ categories }, null, 2),
+            },
+          ],
+        };
+      }
+
+      if (name === "proofpoint_list_category_tools") {
+        const { category } = args as { category: string };
+        const cat = TOOL_CATEGORIES[category];
+        if (!cat) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Unknown category: '${category}'. Available: ${Object.keys(TOOL_CATEGORIES).join(", ")}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        const handler = await getDomainHandler(cat.domain);
+        const domainTools = handler.getTools();
+        // Only return tools that belong to this category
+        const filtered = domainTools.filter((t) => cat.tools.includes(t.name));
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ category, tools: filtered }, null, 2),
+            },
+          ],
+        };
+      }
+
+      if (name === "proofpoint_execute_tool") {
+        const { toolName, arguments: toolArgs } = args as {
+          toolName: string;
+          arguments?: Record<string, unknown>;
+        };
+        const categoryName = toolToCategoryMap.get(toolName);
+        if (!categoryName) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Unknown tool: '${toolName}'. Use proofpoint_list_categories and proofpoint_list_category_tools to discover available tools.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        const cat = TOOL_CATEGORIES[categoryName];
+        const handler = await getDomainHandler(cat.domain);
+        return handler.handleCall(toolName, toolArgs ?? {});
+      }
+
+      if (name === "proofpoint_router") {
+        const { intent } = args as { intent: string };
+        const matchedCategories = routeIntent(intent);
+
+        if (matchedCategories.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No matching categories found for: "${intent}". Use proofpoint_list_categories to see all available categories.`,
+              },
+            ],
+          };
+        }
+
+        const suggestions = matchedCategories.slice(0, 3).map((catName) => {
+          const cat = TOOL_CATEGORIES[catName];
+          return {
+            category: catName,
+            description: cat.description,
+            tools: cat.tools,
+          };
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  intent,
+                  suggestions,
+                  hint: "Use proofpoint_list_category_tools to see full schemas, then proofpoint_execute_tool to run a tool.",
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      // Route to appropriate domain handler based on tool prefix
+      const toolArgs = (args ?? {}) as Record<string, unknown>;
+
+      if (name.startsWith("proofpoint_tap_")) {
+        const handler = await getDomainHandler("tap");
+        return await handler.handleCall(name, toolArgs);
+      }
+      if (name.startsWith("proofpoint_quarantine_")) {
+        const handler = await getDomainHandler("quarantine");
+        return await handler.handleCall(name, toolArgs);
+      }
+      if (name.startsWith("proofpoint_threat_intel_")) {
+        const handler = await getDomainHandler("threat_intel");
+        return await handler.handleCall(name, toolArgs);
+      }
+      if (name.startsWith("proofpoint_dlp_")) {
+        const handler = await getDomainHandler("dlp");
+        return await handler.handleCall(name, toolArgs);
+      }
+      if (name.startsWith("proofpoint_people_")) {
+        const handler = await getDomainHandler("people");
+        return await handler.handleCall(name, toolArgs);
+      }
+      if (name.startsWith("proofpoint_forensics_")) {
+        const handler = await getDomainHandler("forensics");
+        return await handler.handleCall(name, toolArgs);
+      }
+      if (name.startsWith("proofpoint_smart_search_")) {
+        const handler = await getDomainHandler("smart_search");
+        return await handler.handleCall(name, toolArgs);
+      }
+      if (name.startsWith("proofpoint_policy_")) {
+        const handler = await getDomainHandler("policy");
+        return await handler.handleCall(name, toolArgs);
+      }
+      if (name.startsWith("proofpoint_url_defense_")) {
+        const handler = await getDomainHandler("url_defense");
+        return await handler.handleCall(name, toolArgs);
+      }
+      if (name.startsWith("proofpoint_events_")) {
+        const handler = await getDomainHandler("events");
+        return await handler.handleCall(name, toolArgs);
+      }
+      if (name.startsWith("proofpoint_reports_")) {
+        const handler = await getDomainHandler("reports");
+        return await handler.handleCall(name, toolArgs);
+      }
+
+      // Unknown tool
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Unknown tool: ${name}. Use proofpoint_navigate to discover available tools by domain.`,
           },
         ],
+        isError: true,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const stack = error instanceof Error ? error.stack : undefined;
+      logger.error("Tool call failed", { tool: name, error: message, stack });
+      return {
+        content: [{ type: "text", text: `Error: ${message}` }],
+        isError: true,
       };
     }
+  });
 
-    // Route to appropriate domain handler based on tool prefix
-    const toolArgs = (args ?? {}) as Record<string, unknown>;
-
-    if (name.startsWith("proofpoint_tap_")) {
-      const handler = await getDomainHandler("tap");
-      return await handler.handleCall(name, toolArgs);
-    }
-    if (name.startsWith("proofpoint_quarantine_")) {
-      const handler = await getDomainHandler("quarantine");
-      return await handler.handleCall(name, toolArgs);
-    }
-    if (name.startsWith("proofpoint_threat_intel_")) {
-      const handler = await getDomainHandler("threat_intel");
-      return await handler.handleCall(name, toolArgs);
-    }
-    if (name.startsWith("proofpoint_dlp_")) {
-      const handler = await getDomainHandler("dlp");
-      return await handler.handleCall(name, toolArgs);
-    }
-    if (name.startsWith("proofpoint_people_")) {
-      const handler = await getDomainHandler("people");
-      return await handler.handleCall(name, toolArgs);
-    }
-    if (name.startsWith("proofpoint_forensics_")) {
-      const handler = await getDomainHandler("forensics");
-      return await handler.handleCall(name, toolArgs);
-    }
-    if (name.startsWith("proofpoint_smart_search_")) {
-      const handler = await getDomainHandler("smart_search");
-      return await handler.handleCall(name, toolArgs);
-    }
-    if (name.startsWith("proofpoint_policy_")) {
-      const handler = await getDomainHandler("policy");
-      return await handler.handleCall(name, toolArgs);
-    }
-    if (name.startsWith("proofpoint_url_defense_")) {
-      const handler = await getDomainHandler("url_defense");
-      return await handler.handleCall(name, toolArgs);
-    }
-    if (name.startsWith("proofpoint_events_")) {
-      const handler = await getDomainHandler("events");
-      return await handler.handleCall(name, toolArgs);
-    }
-    if (name.startsWith("proofpoint_reports_")) {
-      const handler = await getDomainHandler("reports");
-      return await handler.handleCall(name, toolArgs);
-    }
-
-    // Unknown tool
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Unknown tool: ${name}. Use proofpoint_navigate to discover available tools by domain.`,
-        },
-      ],
-      isError: true,
-    };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const stack = error instanceof Error ? error.stack : undefined;
-    logger.error("Tool call failed", { tool: name, error: message, stack });
-    return {
-      content: [{ type: "text", text: `Error: ${message}` }],
-      isError: true,
-    };
-  }
-});
+  return server;
+}
 
 /**
- * Start the server with stdio transport (default)
+ * Handle a single MCP HTTP request with a fresh, stateless Server + Transport.
+ *
+ * Each request gets its own Server and StreamableHTTPServerTransport (created
+ * without a sessionIdGenerator, so the transport is stateless). Both are
+ * disposed when the response closes. When `creds` is supplied (gateway mode)
+ * the request is processed inside an AsyncLocalStorage context so tool handlers
+ * pick up the per-request credentials without cross-tenant leakage.
+ *
+ * The body is wrapped in try/catch and NEVER rethrows: a global
+ * unhandledRejection handler elsewhere could exit the process, so a single bad
+ * request must not be able to crash the container.
+ */
+async function handleMcpRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  creds?: ProofpointCredentials,
+): Promise<void> {
+  const server = createFreshServer();
+  const transport = new StreamableHTTPServerTransport({
+    enableJsonResponse: true,
+  });
+
+  // Dispose the per-request server + transport once the response is done.
+  res.on("close", () => {
+    void transport.close();
+    void server.close();
+  });
+
+  try {
+    await server.connect(transport);
+    if (creds) {
+      await runWithCredentials(creds, () => transport.handleRequest(req, res));
+    } else {
+      await transport.handleRequest(req, res);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.error("MCP request handling failed", { error: message });
+    if (!res.headersSent) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "Internal error" },
+          id: null,
+        })
+      );
+    }
+  }
+}
+
+/**
+ * Start the server with stdio transport (default).
+ *
+ * stdio is inherently single-client, so it uses one long-lived Server for the
+ * lifetime of the process.
  */
 async function startStdioTransport(): Promise<void> {
+  const server = createFreshServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   logger.info(`Proofpoint MCP server running on stdio (${LAZY_LOADING ? "lazy-loading" : "flattened"} mode)`);
@@ -519,11 +599,6 @@ async function startHttpTransport(): Promise<void> {
   const host = process.env.MCP_HTTP_HOST || "0.0.0.0";
   const isGatewayMode = process.env.AUTH_MODE === "gateway";
 
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-    enableJsonResponse: true,
-  });
-
   const httpServer = createHttpServer((req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
@@ -538,7 +613,7 @@ async function startHttpTransport(): Promise<void> {
       return;
     }
 
-    // MCP endpoint
+    // MCP endpoint - each request gets a fresh, stateless Server + Transport.
     if (url.pathname === "/mcp") {
       // Gateway mode: extract credentials from headers
       if (isGatewayMode) {
@@ -560,18 +635,15 @@ async function startHttpTransport(): Promise<void> {
 
         // Pass credentials via AsyncLocalStorage so concurrent requests
         // cannot leak credentials across tenants.
-        runWithCredentials(
-          {
-            servicePrincipal: principal,
-            serviceSecret: secret,
-            baseUrl: process.env.PROOFPOINT_BASE_URL || "https://tap-api-v2.proofpoint.com",
-          },
-          () => transport.handleRequest(req, res),
-        );
+        void handleMcpRequest(req, res, {
+          servicePrincipal: principal,
+          serviceSecret: secret,
+          baseUrl: process.env.PROOFPOINT_BASE_URL || "https://tap-api-v2.proofpoint.com",
+        });
         return;
       }
 
-      transport.handleRequest(req, res);
+      void handleMcpRequest(req, res);
       return;
     }
 
@@ -579,8 +651,6 @@ async function startHttpTransport(): Promise<void> {
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Not found", endpoints: ["/mcp", "/health"] }));
   });
-
-  await server.connect(transport);
 
   await new Promise<void>((resolve) => {
     httpServer.listen(port, host, () => {
@@ -599,7 +669,6 @@ async function startHttpTransport(): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       httpServer.close((err) => (err ? reject(err) : resolve()));
     });
-    await server.close();
     process.exit(0);
   };
 

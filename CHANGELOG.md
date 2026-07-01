@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Multi-client HTTP transport: the server now builds a fresh `Server` + stateless `StreamableHTTPServerTransport` per `/mcp` request instead of sharing one stateful transport (created with `sessionIdGenerator: () => randomUUID()`) across all requests. The shared stateful transport rejected every client after the first with `-32600 "Server already initialized"`, so behind the multi-user gateway only the first user since container start received any tools and everyone else saw zero tools until a restart. Per-request request handlers are now built by a `createFreshServer()` factory, the transport is stateless (no `sessionIdGenerator`), and each server + transport is disposed on response close. Per-request handling is wrapped in try/catch that responds `500 {-32603 Internal error}` (never rethrows) so a single failed request cannot crash the container. stdio mode still uses one long-lived server; gateway header/credential checks and per-request `AsyncLocalStorage` credential isolation are unchanged.
 - `/health` no longer calls `getCredentials()` — it is now a shallow, unauthenticated liveness probe returning `200 {"status":"ok"}`. In gateway mode credentials only arrive per-request via headers, so the previous credential check always returned `503`, failing the Azure liveness probe and crash-looping the container. Also added `/healthz` as an alias.
 
 ### Added
