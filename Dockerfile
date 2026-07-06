@@ -1,12 +1,12 @@
 # Multi-stage build for Proofpoint MCP Server
-FROM node:22-alpine AS builder
+FROM node:26-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci --ignore-scripts
 COPY . .
 RUN npm run build
 
-FROM node:22-alpine AS production
+FROM node:26-alpine AS production
 RUN addgroup -g 1001 -S appuser && adduser -S appuser -u 1001 -G appuser
 WORKDIR /app
 COPY package*.json ./
