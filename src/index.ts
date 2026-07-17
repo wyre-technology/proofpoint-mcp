@@ -54,6 +54,7 @@ import { isDomainName, type DomainName, type ProofpointCredentials } from "./uti
 import { getCredentials, runWithCredentials } from "./utils/client.js";
 import { logger } from "./utils/logger.js";
 import { setServerRef } from "./utils/server-ref.js";
+import { registerResourceHandlers } from "./resources.js";
 import {
   TOOL_CATEGORIES,
   buildToolToCategoryMap,
@@ -262,6 +263,7 @@ function createFreshServer(): Server {
     {
       capabilities: {
         tools: {},
+        resources: {},
       },
     }
   );
@@ -274,6 +276,9 @@ function createFreshServer(): Server {
 
   // Elicitation helpers reach the active server through this shared ref.
   setServerRef(server);
+
+  // MCP Apps (SEP-1865): serve the ui:// threat card via resources/list + read.
+  registerResourceHandlers(server);
 
   // Handle ListTools requests - always returns ALL tools
   server.setRequestHandler(ListToolsRequestSchema, async () => {

@@ -15,6 +15,7 @@ import type { DomainHandler, CallToolResult } from "../utils/types.js";
 import { apiRequest } from "../utils/client.js";
 import { logger } from "../utils/logger.js";
 import { elicitText } from "../utils/elicitation.js";
+import { buildThreatCard, THREAT_CARD_META } from "../card.builder.js";
 
 function getTools(): Tool[] {
   return [
@@ -37,6 +38,7 @@ function getTools(): Tool[] {
       name: "proofpoint_threat_get_by_id",
       description:
         "Get detailed information about a specific threat by its threat ID. Returns threat type, classification, and associated indicators.",
+      _meta: THREAT_CARD_META,
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -136,8 +138,21 @@ async function handleCall(
         `/v2/threat/summary/${encodeURIComponent(threatId)}`
       );
 
+      // MCP Apps: attach the normalized card payload the ui:// threat card
+      // renders from. Best-effort — a null card (or a builder failure) just
+      // means no UI surface; the tool result itself is never affected.
+      let payload = result;
+      try {
+        const card = buildThreatCard(result);
+        if (card) {
+          payload = { ...(result as Record<string, unknown>), _card: card };
+        }
+      } catch {
+        // Card building must never fail the tool call.
+      }
+
       return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
       };
     }
 
