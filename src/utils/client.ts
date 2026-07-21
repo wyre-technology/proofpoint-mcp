@@ -95,8 +95,16 @@ export async function apiRequest<T>(
     );
   }
 
+  // Join base + path manually rather than relying on `new URL(path, base)`.
+  // That constructor follows WHATWG relative-URL resolution: if `path` starts
+  // with "/", the base's own path (e.g. "/api/" on Proofpoint Essentials) is
+  // discarded entirely rather than preserved. Normalizing slashes on both
+  // sides and concatenating avoids that trap for any base URL, with or
+  // without a path segment.
   const base = options.baseUrl || creds.baseUrl;
-  const url = new URL(path, base);
+  const normalizedBase = base.replace(/\/+$/, "");
+  const normalizedPath = path.replace(/^\/+/, "");
+  const url = new URL(`${normalizedBase}/${normalizedPath}`);
 
   if (options.params) {
     for (const [key, value] of Object.entries(options.params)) {
