@@ -64,6 +64,46 @@ export function getCredentials(): ProofpointCredentials | null {
 }
 
 /**
+ * Resolve per-request gateway credentials from a header accessor.
+ *
+ * Works with any transport: pass a getter that returns a (lowercased) header
+ * value. Returns `{ credentials }` when the required headers are present, or
+ * `{ error }` otherwise. X-Proofpoint-Cluster-Url is optional — falling back
+ * to PROOFPOINT_BASE_URL / the default TAP host mirrors env mode, so a
+ * customer with no region concern doesn't need to supply one. Previously this
+ * header was sent by the gateway but never read here, so per-tenant cluster
+ * URLs (Proofpoint Essentials tenants, EU hosting, etc.) were silently
+ * dropped in favor of whichever host the container happened to boot with.
+ *
+ * Gateway header mapping:
+ *   X-Proofpoint-Service-Principal -> servicePrincipal
+ *   X-Proofpoint-Service-Secret    -> serviceSecret
+ *   X-Proofpoint-Cluster-Url       -> baseUrl (optional)
+ */
+export function resolveGatewayCredentials(
+  getHeader: (lowerName: string) => string | undefined
+): { credentials?: ProofpointCredentials; error?: string } {
+  const servicePrincipal = getHeader("x-proofpoint-service-principal");
+  const serviceSecret = getHeader("x-proofpoint-service-secret");
+  const clusterUrl = getHeader("x-proofpoint-cluster-url");
+
+  if (!servicePrincipal || !serviceSecret) {
+    return {
+      error:
+        "Gateway mode requires X-Proofpoint-Service-Principal and X-Proofpoint-Service-Secret headers",
+    };
+  }
+
+  return {
+    credentials: {
+      servicePrincipal,
+      serviceSecret,
+      baseUrl: clusterUrl || process.env.PROOFPOINT_BASE_URL || DEFAULT_BASE_URL,
+    },
+  };
+}
+
+/**
  * Build the Basic Auth header value from credentials.
  */
 function buildBasicAuth(creds: ProofpointCredentials): string {

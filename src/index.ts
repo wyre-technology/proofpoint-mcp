@@ -25,6 +25,8 @@
  * - gateway: Credentials injected from request headers by the MCP gateway
  *   - Header: X-Proofpoint-Service-Principal
  *   - Header: X-Proofpoint-Service-Secret
+ *   - Header: X-Proofpoint-Cluster-Url (optional — per-tenant API host;
+ *     falls back to PROOFPOINT_BASE_URL / the enterprise TAP default)
  *
  * Domains:
  * - tap: Targeted Attack Protection (SIEM API) - threats, clicks, messages
@@ -51,7 +53,7 @@ import {
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { getDomainHandler, getAvailableDomains } from "./domains/index.js";
 import { isDomainName, type DomainName, type ProofpointCredentials } from "./utils/types.js";
-import { getCredentials, runWithCredentials } from "./utils/client.js";
+import { getCredentials, runWithCredentials, resolveGatewayCredentials } from "./utils/client.js";
 import { logger } from "./utils/logger.js";
 import { setServerRef } from "./utils/server-ref.js";
 import { registerResourceHandlers } from "./resources.js";
@@ -622,16 +624,16 @@ async function startHttpTransport(): Promise<void> {
     if (url.pathname === "/mcp") {
       // Gateway mode: extract credentials from headers
       if (isGatewayMode) {
-        const principal = req.headers["x-proofpoint-service-principal"] as string | undefined;
-        const secret = req.headers["x-proofpoint-service-secret"] as string | undefined;
+        const { credentials, error } = resolveGatewayCredentials(
+          (name) => req.headers[name] as string | undefined
+        );
 
-        if (!principal || !secret) {
+        if (!credentials) {
           res.writeHead(401, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
               error: "Missing credentials",
-              message:
-                "Gateway mode requires X-Proofpoint-Service-Principal and X-Proofpoint-Service-Secret headers",
+              message: error,
               required: ["X-Proofpoint-Service-Principal", "X-Proofpoint-Service-Secret"],
             })
           );
@@ -640,11 +642,7 @@ async function startHttpTransport(): Promise<void> {
 
         // Pass credentials via AsyncLocalStorage so concurrent requests
         // cannot leak credentials across tenants.
-        void handleMcpRequest(req, res, {
-          servicePrincipal: principal,
-          serviceSecret: secret,
-          baseUrl: process.env.PROOFPOINT_BASE_URL || "https://tap-api-v2.proofpoint.com",
-        });
+        void handleMcpRequest(req, res, credentials);
         return;
       }
 
